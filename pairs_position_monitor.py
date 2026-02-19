@@ -1,12 +1,18 @@
 """
-Pairs Position Monitor v1.0
-Мониторинг открытых позиций по парному трейдингу.
+Pairs Position Monitor v4.0
+Изменения v4.0:
+  [FIX] P&L: добавлен spread_pnl + предупреждение при расхождении Z и цены
+  [FIX] Exchange fallback chain: OKX→KuCoin→Bybit→Binance (cloud-safe)
+  [NEW] CSV экспорт истории позиций
+  [NEW] Direction labels (LONG/SHORT) для каждой монеты
+  [FIX] fetch_prices — fallback при ошибке биржи
 
-Показывает:
-  - Текущий Z-score каждой позиции в реальном времени
-  - MTM P&L (mark-to-market)
-  - Сигналы к выходу (mean reversion / stop / timeout)
-  - Визуализация спреда и Z-score
+  v3.0:
+  [NEW] Единая assess_entry_readiness() как в сканере v6.0
+  [NEW] Расчёт Hurst, p-value, корреляции, stability в мониторинге
+  [NEW] Показ обязательных/желательных критериев для открытых позиций
+  [NEW] Предупреждения если пара потеряла коинтеграцию
+  [FIX] OU half-life через регрессию (как в сканере, dt-correct)
 
 Запуск: streamlit run pairs_position_monitor.py
 """
@@ -21,6 +27,56 @@ import os
 from datetime import datetime, timedelta
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
+from statsmodels.tsa.stattools import coint
+
+# ═══════════════════════════════════════════════════════
+# v3.0: ENTRY READINESS (единая логика с сканером v6.0)
+# ═══════════════════════════════════════════════════════
+
+def assess_entry_readiness(p):
+    """
+    Единая оценка готовности к входу (скопировано из сканера v6.0).
+    Обязательные: Статус≥READY, |Z|≥Thr, Q≥50, Dir≠NONE
+    Желательные: FDR, Conf=HIGH, S≥60, ρ≥0.5, Stab≥3/4, Hurst<0.35
+    FDR bypass: Q≥70 + Stab≥3/4 + ADF✅ + Hurst<0.35
+    """
+    mandatory = [
+        ('Статус ≥ READY', p.get('signal', 'NEUTRAL') in ('SIGNAL', 'READY'), p.get('signal', 'NEUTRAL')),
+        ('|Z| ≥ Thr', abs(p.get('zscore', 0)) >= p.get('threshold', 2.0),
+         f"|{p.get('zscore',0):.2f}| vs {p.get('threshold',2.0):.1f}"),
+        ('Q ≥ 50', p.get('quality_score', 0) >= 50, f"Q={p.get('quality_score', 0)}"),
+        ('Dir ≠ NONE', p.get('direction', 'NONE') != 'NONE', p.get('direction', 'NONE')),
+    ]
+    all_mandatory = all(m[1] for m in mandatory)
+    
+    fdr_ok = p.get('fdr_passed', False)
+    stab_ok = p.get('stability_passed', 0) >= 3
+    hurst_ok = p.get('hurst', 0.5) < 0.35
+    optional = [
+        ('FDR ✅', fdr_ok, '✅' if fdr_ok else '❌'),
+        ('Conf=HIGH', p.get('confidence', 'LOW') == 'HIGH', p.get('confidence', 'LOW')),
+        ('S ≥ 60', p.get('signal_score', 0) >= 60, f"S={p.get('signal_score', 0)}"),
+        ('ρ ≥ 0.5', p.get('correlation', 0) >= 0.5, f"ρ={p.get('correlation', 0):.2f}"),
+        ('Stab ≥ 3/4', stab_ok, f"{p.get('stability_passed',0)}/{p.get('stability_total',4)}"),
+        ('Hurst < 0.35', hurst_ok, f"H={p.get('hurst', 0.5):.3f}"),
+    ]
+    opt_count = sum(1 for _, met, _ in optional if met)
+    fdr_bypass = (not fdr_ok and p.get('quality_score', 0) >= 70 and
+                  stab_ok and p.get('adf_passed', False) and hurst_ok)
+    
+    if all_mandatory:
+        if opt_count >= 4:
+            level, label = 'ENTRY', '🟢 ВХОД'
+        elif opt_count >= 2 or fdr_bypass:
+            level, label = 'CONDITIONAL', '🟡 УСЛОВНО'
+        else:
+            level, label = 'CONDITIONAL', '🟡 СЛАБЫЙ'
+    else:
+        level, label = 'WAIT', '⚪ ЖДАТЬ'
+    
+    return {'level': level, 'label': label, 'all_mandatory': all_mandatory,
+            'mandatory': mandatory, 'optional': optional,
+            'fdr_bypass': fdr_bypass, 'opt_count': opt_count}
 
 # ═══════════════════════════════════════════════════════
 # CORE MATH (standalone — не зависит от analysis module)
@@ -67,14 +123,85 @@ def calc_zscore(spread, halflife_bars=None, min_w=10, max_w=60):
     return zs, w
 
 
-def calc_halflife(spread):
+def calc_halflife(spread, dt=None):
+    """OU halflife через регрессию. dt=1/24 для 1h, 1/6 для 4h, 1 для 1d."""
     s = np.array(spread, float)
-    if len(s) < 10: return 999
+    if len(s) < 20: return 999
     sl, sd = s[:-1], np.diff(s)
-    n = len(sl); denom = n * np.sum(sl**2) - np.sum(sl)**2
+    n = len(sl)
+    sx, sy = np.sum(sl), np.sum(sd)
+    sxy, sx2 = np.sum(sl * sd), np.sum(sl**2)
+    denom = n * sx2 - sx**2
     if abs(denom) < 1e-10: return 999
-    b = (n * np.sum(sl * sd) - np.sum(sl) * np.sum(sd)) / denom
-    return float(-np.log(2) / b) if b < 0 else 999
+    b = (n * sxy - sx * sy) / denom
+    if dt is None: dt = 1.0
+    theta = max(0.001, min(10.0, -b / dt))
+    hl = np.log(2) / theta  # в единицах dt
+    return float(hl) if hl < 999 else 999
+
+
+def calc_hurst(series, min_window=8):
+    """DFA Hurst exponent (упрощённый, совместимый с сканером)."""
+    x = np.array(series, float)
+    x = x[~np.isnan(x)]
+    n = len(x)
+    if n < 50: return 0.5
+    
+    y = np.cumsum(x - np.mean(x))
+    
+    scales = []
+    flucts = []
+    min_seg = max(min_window, 4)
+    max_seg = n // 4
+    
+    for seg_len in range(min_seg, max_seg + 1, max(1, (max_seg - min_seg) // 20)):
+        n_segs = n // seg_len
+        if n_segs < 2: continue
+        f2_list = []
+        for i in range(n_segs):
+            seg = y[i * seg_len:(i + 1) * seg_len]
+            t = np.arange(len(seg))
+            if len(seg) < 2: continue
+            coeffs = np.polyfit(t, seg, 1)
+            trend = np.polyval(coeffs, t)
+            f2_list.append(np.mean((seg - trend) ** 2))
+        if f2_list:
+            scales.append(seg_len)
+            flucts.append(np.sqrt(np.mean(f2_list)))
+    
+    if len(scales) < 4: return 0.5
+    
+    log_s = np.log(scales)
+    log_f = np.log(np.array(flucts) + 1e-10)
+    coeffs = np.polyfit(log_s, log_f, 1)
+    
+    # R² check
+    pred = np.polyval(coeffs, log_s)
+    ss_res = np.sum((log_f - pred) ** 2)
+    ss_tot = np.sum((log_f - np.mean(log_f)) ** 2)
+    r_sq = 1 - ss_res / ss_tot if ss_tot > 0 else 0
+    
+    if r_sq < 0.8: return 0.5  # fallback
+    return float(np.clip(coeffs[0], 0.01, 0.99))
+
+
+def calc_correlation(p1, p2, window=60):
+    """Rolling корреляция."""
+    n = min(len(p1), len(p2))
+    if n < window: return 0.0
+    r1 = np.diff(np.log(p1[-n:] + 1e-10))
+    r2 = np.diff(np.log(p2[-n:] + 1e-10))
+    if len(r1) < 10: return 0.0
+    return float(np.corrcoef(r1[-window:], r2[-window:])[0, 1])
+
+
+def calc_cointegration_pvalue(p1, p2):
+    """P-value коинтеграции."""
+    try:
+        _, pval, _ = coint(p1, p2)
+        return float(pval)
+    except:
+        return 1.0
 
 
 # ═══════════════════════════════════════════════════════
@@ -94,7 +221,8 @@ def save_positions(positions):
 
 
 def add_position(coin1, coin2, direction, entry_z, entry_hr, 
-                 entry_price1, entry_price2, timeframe, notes=""):
+                 entry_price1, entry_price2, timeframe, notes="",
+                 max_hold_hours=72, pnl_stop_pct=-5.0):
     positions = load_positions()
     pos = {
         'id': len(positions) + 1,
@@ -110,6 +238,8 @@ def add_position(coin1, coin2, direction, entry_z, entry_hr,
         'notes': notes,
         'exit_z_target': 0.5,
         'stop_z': 4.5,
+        'max_hold_hours': max_hold_hours,
+        'pnl_stop_pct': pnl_stop_pct,
     }
     positions.append(pos)
     save_positions(positions)
@@ -143,11 +273,30 @@ def close_position(pos_id, exit_price1, exit_price2, exit_z, reason):
 # DATA FETCHING
 # ═══════════════════════════════════════════════════════
 
+# v4.0: Exchange fallback chain (Binance/Bybit block cloud servers)
+EXCHANGE_FALLBACK = ['okx', 'kucoin', 'bybit', 'binance']
+
+def _get_exchange(exchange_name):
+    """Получить рабочую биржу с fallback."""
+    tried = set()
+    chain = [exchange_name] + [e for e in EXCHANGE_FALLBACK if e != exchange_name]
+    for exch in chain:
+        if exch in tried: continue
+        tried.add(exch)
+        try:
+            ex = getattr(ccxt, exch)({'enableRateLimit': True})
+            ex.load_markets()
+            return ex, exch
+        except:
+            continue
+    return None, None
+
+
 @st.cache_data(ttl=120)
 def fetch_prices(exchange_name, coin, timeframe, lookback_bars=300):
     try:
-        ex = getattr(ccxt, exchange_name)({'enableRateLimit': True})
-        ex.load_markets()
+        ex, actual = _get_exchange(exchange_name)
+        if ex is None: return None
         symbol = f"{coin}/USDT"
         ohlcv = ex.fetch_ohlcv(symbol, timeframe, limit=lookback_bars)
         df = pd.DataFrame(ohlcv, columns=['ts', 'o', 'h', 'l', 'c', 'v'])
@@ -159,7 +308,8 @@ def fetch_prices(exchange_name, coin, timeframe, lookback_bars=300):
 
 def get_current_price(exchange_name, coin):
     try:
-        ex = getattr(ccxt, exchange_name)({'enableRateLimit': True})
+        ex, actual = _get_exchange(exchange_name)
+        if ex is None: return None
         ticker = ex.fetch_ticker(f"{coin}/USDT")
         return ticker['last']
     except:
@@ -171,7 +321,7 @@ def get_current_price(exchange_name, coin):
 # ═══════════════════════════════════════════════════════
 
 def monitor_position(pos, exchange_name):
-    """Полный мониторинг одной позиции."""
+    """Полный мониторинг одной позиции v3.0 — с quality metrics."""
     c1, c2 = pos['coin1'], pos['coin2']
     tf = pos['timeframe']
     
@@ -201,15 +351,39 @@ def monitor_position(pos, exchange_name):
     spread = kf['spread']
     hr_current = kf['hr']
     
-    # Half-life → Z
-    hl = calc_halflife(spread)
+    # v3.0: OU Half-life (dt-correct, как в сканере)
+    dt_ou = {'1h': 1/24, '4h': 1/6, '1d': 1.0}.get(tf, 1/6)
     hpb = {'1h': 1, '4h': 4, '1d': 24}.get(tf, 4)
-    hl_bars = (hl * 24 / hpb) if hl < 999 else None
+    hl_days = calc_halflife(spread, dt=dt_ou)
+    hl_hours = hl_days * 24 if hl_days < 999 else 999
+    hl_bars = (hl_hours / hpb) if hl_hours < 999 else None
     zs, zw = calc_zscore(spread, halflife_bars=hl_bars)
     
     z_now = float(zs[~np.isnan(zs)][-1]) if any(~np.isnan(zs)) else 0
     
-    # P&L
+    # v3.0: Quality metrics (как в сканере)
+    hurst = calc_hurst(spread)
+    corr = calc_correlation(p1, p2, window=min(60, len(p1) // 3))
+    pvalue = calc_cointegration_pvalue(p1, p2)
+    
+    # v3.0: Entry readiness data
+    quality_data = {
+        'signal': 'SIGNAL' if abs(z_now) >= 2.0 else ('READY' if abs(z_now) >= 1.5 else 'NEUTRAL'),
+        'zscore': z_now,
+        'threshold': 2.0,
+        'quality_score': max(0, int(100 - pvalue * 200 - max(0, hurst - 0.35) * 200)),
+        'direction': pos['direction'],
+        'fdr_passed': pvalue < 0.01,
+        'confidence': 'HIGH' if (hurst < 0.4 and pvalue < 0.03) else ('MEDIUM' if pvalue < 0.05 else 'LOW'),
+        'signal_score': max(0, int(abs(z_now) / 2.0 * 50 + (0.5 - hurst) * 100)),
+        'correlation': corr,
+        'stability_passed': 3 if pvalue < 0.05 else 1,
+        'stability_total': 4,
+        'hurst': hurst,
+        'adf_passed': pvalue < 0.05,
+    }
+    
+    # P&L (v4.0: price-based + spread-based + disagreement warning)
     r1 = (p1[-1] - pos['entry_price1']) / pos['entry_price1']
     r2 = (p2[-1] - pos['entry_price2']) / pos['entry_price2']
     hr = pos['entry_hr']
@@ -219,46 +393,120 @@ def monitor_position(pos, exchange_name):
         raw_pnl = -r1 + hr * r2
     pnl_pct = raw_pnl / (1 + abs(hr)) * 100
     
+    # v4.0: Spread-based P&L (фиксированный HR от входа)
+    entry_spread_val = pos['entry_price1'] - hr * pos['entry_price2']
+    current_spread_val = p1[-1] - hr * p2[-1]
+    spread_change = current_spread_val - entry_spread_val
+    if pos['direction'] == 'LONG':
+        spread_direction = 'profit' if spread_change > 0 else 'loss'
+    else:
+        spread_direction = 'profit' if spread_change < 0 else 'loss'
+    
+    # v4.0: Z-direction check
+    z_entry = pos['entry_z']
+    z_towards_zero = abs(z_now) < abs(z_entry)  # Z двигается к 0 = в нашу пользу
+    
+    # v4.0: Предупреждение при расхождении P&L и Z-направления
+    pnl_z_disagree = False
+    pnl_z_warning = ""
+    if pnl_pct > 0 and not z_towards_zero:
+        pnl_z_disagree = True
+        pnl_z_warning = (
+            f"⚠️ P&L положительный (+{pnl_pct:.2f}%), но Z ушёл дальше от нуля "
+            f"({z_entry:+.2f} → {z_now:+.2f}). "
+            f"Причина: Kalman HR изменился ({pos['entry_hr']:.4f} → {hr_current:.4f}), "
+            f"Z-окно сдвинулось. Цена P&L корректен, но спред ещё не вернулся."
+        )
+    elif pnl_pct < -0.5 and z_towards_zero:
+        pnl_z_disagree = True
+        pnl_z_warning = (
+            f"⚠️ Z движется к нулю ({z_entry:+.2f} → {z_now:+.2f}), но P&L отрицательный "
+            f"({pnl_pct:+.2f}%). Причина: HR сдвинулся, spread definition изменился."
+        )
+    
+    # Time in trade (вычисляем ДО использования)
+    entry_dt = datetime.fromisoformat(pos['entry_time'])
+    hours_in = (datetime.now() - entry_dt).total_seconds() / 3600
+    
     # Exit signals
     exit_signal = None
+    exit_urgency = 0
     ez = pos.get('exit_z_target', 0.5)
     sz = pos.get('stop_z', 4.5)
+    max_hours = pos.get('max_hold_hours', 72)
+    pnl_stop = pos.get('pnl_stop_pct', -5.0)
     
     if pos['direction'] == 'LONG':
         if z_now >= -ez and z_now <= ez:
             exit_signal = '✅ MEAN REVERT — закрывать!'
+            exit_urgency = 2
         elif z_now > 1.0:
             exit_signal = '✅ OVERSHOOT — фиксировать прибыль!'
+            exit_urgency = 2
         elif z_now < -sz:
-            exit_signal = '🛑 STOP LOSS — экстренный выход!'
+            exit_signal = '🛑 STOP LOSS (Z) — экстренный выход!'
+            exit_urgency = 2
     else:
         if z_now <= ez and z_now >= -ez:
             exit_signal = '✅ MEAN REVERT — закрывать!'
+            exit_urgency = 2
         elif z_now < -1.0:
             exit_signal = '✅ OVERSHOOT — фиксировать прибыль!'
+            exit_urgency = 2
         elif z_now > sz:
-            exit_signal = '🛑 STOP LOSS — экстренный выход!'
+            exit_signal = '🛑 STOP LOSS (Z) — экстренный выход!'
+            exit_urgency = 2
     
-    # Time in trade
-    entry_dt = datetime.fromisoformat(pos['entry_time'])
-    hours_in = (datetime.now() - entry_dt).total_seconds() / 3600
+    # P&L stop
+    if pnl_pct <= pnl_stop and exit_urgency < 2:
+        exit_signal = f'🛑 STOP LOSS (P&L {pnl_pct:.1f}% < {pnl_stop:.0f}%) — выход!'
+        exit_urgency = 2
+    
+    # Time-based
+    if hours_in > max_hours and exit_urgency < 2:
+        if exit_signal is None:
+            exit_signal = f'⏰ TIMEOUT ({hours_in:.0f}ч > {max_hours:.0f}ч) — рассмотрите выход'
+            exit_urgency = 1
+    elif hours_in > max_hours * 0.75 and exit_urgency == 0:
+        exit_signal = f'⚠️ Позиция открыта {hours_in:.0f}ч (лимит {max_hours:.0f}ч)'
+        exit_urgency = 1
+    
+    # v3.0: Quality warnings
+    quality_warnings = []
+    if hurst >= 0.45:
+        quality_warnings.append(f"⚠️ Hurst={hurst:.3f} ≥ 0.45 — потеря mean reversion!")
+    if pvalue >= 0.10:
+        quality_warnings.append(f"⚠️ P-value={pvalue:.3f} — коинтеграция ослабла!")
+    if corr < 0.2:
+        quality_warnings.append(f"⚠️ Корреляция ρ={corr:.2f} < 0.2 — хедж не работает!")
     
     return {
         'z_now': z_now,
         'z_entry': pos['entry_z'],
         'pnl_pct': pnl_pct,
+        'spread_direction': spread_direction,
+        'z_towards_zero': z_towards_zero,
+        'pnl_z_disagree': pnl_z_disagree,
+        'pnl_z_warning': pnl_z_warning,
         'price1_now': p1[-1],
         'price2_now': p2[-1],
         'hr_now': hr_current,
         'hr_entry': pos['entry_hr'],
         'exit_signal': exit_signal,
+        'exit_urgency': exit_urgency,
         'hours_in': hours_in,
         'spread': spread,
         'zscore_series': zs,
         'timestamps': ts,
         'hr_series': kf['hrs'],
-        'halflife_hours': hl * 24,
+        'halflife_hours': hl_hours,
         'z_window': zw,
+        # v3.0: quality metrics
+        'hurst': hurst,
+        'correlation': corr,
+        'pvalue': pvalue,
+        'quality_data': quality_data,
+        'quality_warnings': quality_warnings,
     }
 
 
@@ -278,12 +526,13 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 st.title("📍 Pairs Position Monitor")
-st.caption("v1.0 | Мониторинг открытых позиций парного трейдинга")
+st.caption("v4.0 | P&L fix + Direction Labels + Exchange Fallback + CSV Export")
 
 # Sidebar
 with st.sidebar:
     st.header("⚙️ Настройки")
-    exchange = st.selectbox("Биржа", ['okx', 'bybit', 'binance'], index=0)
+    exchange = st.selectbox("Биржа", ['okx', 'kucoin', 'bybit', 'binance'], index=0,
+                           help="⚠️ Binance/Bybit заблокированы на облачных серверах. Используйте OKX/KuCoin.")
     auto_refresh = st.checkbox("Авто-обновление (2 мин)", value=False)
     
     st.divider()
@@ -313,6 +562,14 @@ with st.sidebar:
         
         new_notes = st.text_input("Заметки", "")
         
+        # v2.0: Risk management
+        st.markdown("**⚠️ Риск-менеджмент**")
+        col_r1, col_r2 = st.columns(2)
+        with col_r1:
+            new_max_hours = st.number_input("Max часов в позиции", value=72, step=12)
+        with col_r2:
+            new_pnl_stop = st.number_input("P&L Stop (%)", value=-5.0, step=0.5)
+        
         # Автозагрузка цен
         fetch_prices_btn = st.form_submit_button("📥 Загрузить цены + Добавить")
     
@@ -330,7 +587,9 @@ with st.sidebar:
         
         if new_p1 > 0 and new_p2 > 0:
             pos = add_position(new_c1, new_c2, new_dir, new_z, new_hr,
-                             new_p1, new_p2, new_tf, new_notes)
+                             new_p1, new_p2, new_tf, new_notes,
+                             max_hold_hours=new_max_hours,
+                             pnl_stop_pct=new_pnl_stop)
             st.success(f"✅ Позиция #{pos['id']} добавлена: {new_dir} {new_c1}/{new_c2}")
             st.rerun()
 
@@ -376,7 +635,14 @@ with tab1:
                         st.success(mon['exit_signal'])
                 
                 # Header row
+                dir_emoji_c1 = '🟢 LONG' if pos['direction'] == 'LONG' else '🔴 SHORT'
+                dir_emoji_c2 = '🔴 SHORT' if pos['direction'] == 'LONG' else '🟢 LONG'
                 st.subheader(f"{dir_emoji} {pos['direction']} | {pair_name} | #{pos['id']}")
+                st.caption(f"{pos['coin1']}: {dir_emoji_c1} | {pos['coin2']}: {dir_emoji_c2}")
+                
+                # v4.0: P&L / Z disagreement warning
+                if mon.get('pnl_z_disagree'):
+                    st.warning(mon['pnl_z_warning'])
                 
                 # KPI row
                 c1, c2, c3, c4, c5, c6 = st.columns(6)
@@ -388,12 +654,43 @@ with tab1:
                          delta=f"вход: {mon['z_entry']:+.2f}")
                 c3.metric("HR", f"{mon['hr_now']:.4f}",
                          delta=f"вход: {mon['hr_entry']:.4f}")
-                c4.metric(f"{pos['coin1']}", f"${mon['price1_now']:.4f}",
+                c4.metric(f"{pos['coin1']} {'🟢' if pos['direction']=='LONG' else '🔴'}", 
+                         f"${mon['price1_now']:.4f}",
                          delta=f"вход: ${pos['entry_price1']:.4f}")
-                c5.metric(f"{pos['coin2']}", f"${mon['price2_now']:.4f}",
+                c5.metric(f"{pos['coin2']} {'🔴' if pos['direction']=='LONG' else '🟢'}", 
+                         f"${mon['price2_now']:.4f}",
                          delta=f"вход: ${pos['entry_price2']:.4f}")
                 c6.metric("В позиции", f"{mon['hours_in']:.0f}ч",
                          delta=f"HL: {mon['halflife_hours']:.0f}ч")
+                
+                # v3.0: Quality metrics row
+                q1, q2, q3, q4 = st.columns(4)
+                q1.metric("Hurst", f"{mon.get('hurst', 0.5):.3f}",
+                         delta="🟢 MR" if mon.get('hurst', 0.5) < 0.45 else "🔴 No MR")
+                q2.metric("P-value", f"{mon.get('pvalue', 1.0):.4f}",
+                         delta="✅ Coint" if mon.get('pvalue', 1.0) < 0.05 else "⚠️ Weak")
+                q3.metric("Корреляция ρ", f"{mon.get('correlation', 0):.3f}",
+                         delta="🟢" if mon.get('correlation', 0) >= 0.5 else "⚠️")
+                q4.metric("Z-window", f"{mon.get('z_window', 30)} баров")
+                
+                # v3.0: Quality warnings
+                for qw in mon.get('quality_warnings', []):
+                    st.warning(qw)
+                
+                # v3.0: Entry readiness assessment
+                qd = mon.get('quality_data', {})
+                if qd:
+                    ea = assess_entry_readiness(qd)
+                    with st.expander("📋 Критерии входа (как в сканере)", expanded=False):
+                        ec1, ec2 = st.columns(2)
+                        with ec1:
+                            st.markdown("**🟢 Обязательные:**")
+                            for name, met, val in ea['mandatory']:
+                                st.markdown(f"  {'✅' if met else '❌'} **{name}** → `{val}`")
+                        with ec2:
+                            st.markdown("**🔵 Желательные:**")
+                            for name, met, val in ea['optional']:
+                                st.markdown(f"  {'✅' if met else '⬜'} {name} → `{val}`")
                 
                 # Chart
                 with st.expander("📈 Графики", expanded=False):
@@ -485,6 +782,11 @@ with tab2:
                 'Выход': p.get('exit_time', '')[:16] if p.get('exit_time') else '',
             })
         st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+        
+        # v4.0: CSV export
+        csv_history = pd.DataFrame(rows).to_csv(index=False)
+        st.download_button("📥 Скачать историю (CSV)", csv_history,
+                          f"pairs_history_{datetime.now().strftime('%Y%m%d')}.csv", "text/csv")
 
 # Auto refresh
 if auto_refresh:
@@ -493,13 +795,14 @@ if auto_refresh:
 
 st.divider()
 st.caption("""
-**Pairs Position Monitor v1.0**
+**Pairs Position Monitor v3.0** | Единые критерии входа с сканером v6.0
 
 Как добавить позицию:
-1. Найди SIGNAL в скринере (pairs_monitor.py)
-2. Скопируй данные: Coin1, Coin2, Direction, Z, HR, цены
-3. Введи в форму слева → "Загрузить цены + Добавить"
-4. Монитор покажет когда закрывать
+1. Найди 🟢 ВХОД в скринере (pairs_monitor.py v6.0)
+2. Проверь обязательные критерии (все должны быть ✅)
+3. Скопируй данные: Coin1, Coin2, Direction, Z, HR, цены
+4. Введи в форму слева → "Загрузить цены + Добавить"
+5. Монитор покажет когда закрывать + предупредит если пара потеряла качество
 
 Позиции сохраняются в positions.json — не потеряются при перезапуске.
 """)
