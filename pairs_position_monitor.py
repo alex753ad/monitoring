@@ -35,15 +35,13 @@ from statsmodels.tsa.stattools import coint
 
 def assess_entry_readiness(p):
     """
-    Единая оценка готовности к входу (скопировано из сканера v6.0).
-    Обязательные: Статус≥READY, |Z|≥Thr, Q≥50, Dir≠NONE
-    Желательные: FDR, Conf=HIGH, S≥60, ρ≥0.5, Stab≥3/4, Hurst<0.35
-    FDR bypass: Q≥70 + Stab≥3/4 + ADF✅ + Hurst<0.35
+    v8.0: Единая оценка с HARD HURST GATE.
+    Hurst ≥ 0.45 → max УСЛОВНО. Hurst=0.500 fallback → max СЛАБЫЙ.
     """
     mandatory = [
         ('Статус ≥ READY', p.get('signal', 'NEUTRAL') in ('SIGNAL', 'READY'), p.get('signal', 'NEUTRAL')),
         ('|Z| ≥ Thr', abs(p.get('zscore', 0)) >= p.get('threshold', 2.0),
-         f"|{p.get('zscore',0):.2f}| vs {p.get('threshold',2.0):.1f}"),
+         f"|{p.get('zscore',0):.2f}| vs {p.get('threshold',2.0)}"),
         ('Q ≥ 50', p.get('quality_score', 0) >= 50, f"Q={p.get('quality_score', 0)}"),
         ('Dir ≠ NONE', p.get('direction', 'NONE') != 'NONE', p.get('direction', 'NONE')),
     ]
@@ -51,21 +49,28 @@ def assess_entry_readiness(p):
     
     fdr_ok = p.get('fdr_passed', False)
     stab_ok = p.get('stability_passed', 0) >= 3
-    hurst_ok = p.get('hurst', 0.5) < 0.35
+    hurst_val = p.get('hurst', 0.5)
+    hurst_ok = hurst_val < 0.35
+    hurst_is_fallback = hurst_val == 0.5
+    
     optional = [
         ('FDR ✅', fdr_ok, '✅' if fdr_ok else '❌'),
         ('Conf=HIGH', p.get('confidence', 'LOW') == 'HIGH', p.get('confidence', 'LOW')),
         ('S ≥ 60', p.get('signal_score', 0) >= 60, f"S={p.get('signal_score', 0)}"),
         ('ρ ≥ 0.5', p.get('correlation', 0) >= 0.5, f"ρ={p.get('correlation', 0):.2f}"),
         ('Stab ≥ 3/4', stab_ok, f"{p.get('stability_passed',0)}/{p.get('stability_total',4)}"),
-        ('Hurst < 0.35', hurst_ok, f"H={p.get('hurst', 0.5):.3f}"),
+        ('Hurst < 0.35', hurst_ok, f"H={hurst_val:.3f}"),
     ]
     opt_count = sum(1 for _, met, _ in optional if met)
     fdr_bypass = (not fdr_ok and p.get('quality_score', 0) >= 70 and
                   stab_ok and p.get('adf_passed', False) and hurst_ok)
     
     if all_mandatory:
-        if opt_count >= 4:
+        if hurst_is_fallback:
+            level, label = 'CONDITIONAL', '🟡 СЛАБЫЙ ⚠️H=0.5'
+        elif hurst_val >= 0.45:
+            level, label = 'CONDITIONAL', '🟡 УСЛОВНО ⚠️H≥0.45'
+        elif opt_count >= 4:
             level, label = 'ENTRY', '🟢 ВХОД'
         elif opt_count >= 2 or fdr_bypass:
             level, label = 'CONDITIONAL', '🟡 УСЛОВНО'
@@ -224,6 +229,8 @@ def add_position(coin1, coin2, direction, entry_z, entry_hr,
                  entry_price1, entry_price2, timeframe, notes="",
                  max_hold_hours=72, pnl_stop_pct=-5.0):
     positions = load_positions()
+    # v5.0: Adaptive stop_z — at least 2.0 Z-units beyond entry
+    adaptive_stop = max(abs(entry_z) + 2.0, 4.0)
     pos = {
         'id': len(positions) + 1,
         'coin1': coin1, 'coin2': coin2,
@@ -237,7 +244,7 @@ def add_position(coin1, coin2, direction, entry_z, entry_hr,
         'status': 'OPEN',
         'notes': notes,
         'exit_z_target': 0.5,
-        'stop_z': 4.5,
+        'stop_z': adaptive_stop,
         'max_hold_hours': max_hold_hours,
         'pnl_stop_pct': pnl_stop_pct,
     }
@@ -432,7 +439,9 @@ def monitor_position(pos, exchange_name):
     exit_signal = None
     exit_urgency = 0
     ez = pos.get('exit_z_target', 0.5)
-    sz = pos.get('stop_z', 4.5)
+    # v5.0: Adaptive stop — at least 2.0 Z-units beyond entry, minimum 4.0
+    default_stop = max(abs(pos['entry_z']) + 2.0, 4.0)
+    sz = pos.get('stop_z', default_stop)
     max_hours = pos.get('max_hold_hours', 72)
     pnl_stop = pos.get('pnl_stop_pct', -5.0)
     
@@ -526,7 +535,7 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 st.title("📍 Pairs Position Monitor")
-st.caption("v4.0 | P&L fix + Direction Labels + Exchange Fallback + CSV Export")
+st.caption("v5.0 | Hurst Hard Gate + Adaptive Stop + P&L fix + Direction Labels")
 
 # Sidebar
 with st.sidebar:
