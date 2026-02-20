@@ -403,6 +403,159 @@ class CryptoPairsScanner:
         except Exception as e:
             return None
     
+    def mtf_confirm(self, coin1, coin2, primary_direction, primary_z, primary_hr):
+        """
+        v10.0: Multi-Timeframe Confirmation
+        
+        Загружает данные на младшем ТФ (4h→1h, 1d→4h) и проверяет:
+          1. Z-direction: младший ТФ подтверждает направление старшего
+          2. Z-velocity: Z движется к нулю (mean reversion началась)
+          3. Z-magnitude: |Z| > 0.5 (ещё не вернулся к среднему)
+          4. Price momentum: короткий импульс в нужную сторону
+          
+        Returns:
+          dict с mtf_confirmed, mtf_z, mtf_velocity, mtf_details
+          или None если данные недоступны
+        """
+        # Определяем младший TF
+        confirm_tf = {
+            '4h': '1h',
+            '1d': '4h',
+            '2h': '1h',
+        }.get(self.timeframe)
+        
+        if confirm_tf is None:
+            # Уже на младшем ТФ — нечего подтверждать
+            return {'mtf_confirmed': None, 'mtf_reason': 'N/A (уже на минимальном TF)'}
+        
+        try:
+            # Загружаем данные на младшем ТФ (последние 7 дней достаточно для Z)
+            hpb = {'1h': 24, '4h': 6, '1d': 1}.get(confirm_tf, 6)
+            limit = 7 * hpb  # 7 дней на младшем ТФ (168 баров для 1h)
+            
+            ohlcv1 = self.exchange.fetch_ohlcv(f"{coin1}/USDT", confirm_tf, limit=limit)
+            ohlcv2 = self.exchange.fetch_ohlcv(f"{coin2}/USDT", confirm_tf, limit=limit)
+            
+            if len(ohlcv1) < 50 or len(ohlcv2) < 50:
+                return {'mtf_confirmed': None, 'mtf_reason': f'Мало данных {confirm_tf}'}
+            
+            df1 = pd.DataFrame(ohlcv1, columns=['ts','o','h','l','c','v'])
+            df2 = pd.DataFrame(ohlcv2, columns=['ts','o','h','l','c','v'])
+            df1['ts'] = pd.to_datetime(df1['ts'], unit='ms')
+            df2['ts'] = pd.to_datetime(df2['ts'], unit='ms')
+            
+            merged = pd.merge(df1[['ts','c']], df2[['ts','c']], on='ts', suffixes=('_1','_2'))
+            if len(merged) < 50:
+                return {'mtf_confirmed': None, 'mtf_reason': f'Мало общих баров {confirm_tf}'}
+            
+            p1 = merged['c_1'].values
+            p2 = merged['c_2'].values
+            
+            # Строим спред на младшем ТФ с HR от старшего (для сопоставимости)
+            spread_ltf = p1 - primary_hr * p2
+            
+            # Z-score на младшем ТФ (окно ~30 баров)
+            n = len(spread_ltf)
+            z_window = min(30, n // 2)
+            lookback = spread_ltf[-z_window:]
+            med = np.median(lookback)
+            mad = np.median(np.abs(lookback - med)) * 1.4826
+            
+            if mad < 1e-10:
+                s = np.std(lookback)
+                current_z = (spread_ltf[-1] - np.mean(lookback)) / s if s > 1e-10 else 0
+            else:
+                current_z = (spread_ltf[-1] - med) / mad
+            
+            # Z-velocity: среднее изменение Z за последние 5 баров
+            z_series = []
+            for i in range(max(z_window, 10), n):
+                lb = spread_ltf[i-z_window:i]
+                m = np.median(lb)
+                d = np.median(np.abs(lb - m)) * 1.4826
+                if d < 1e-10:
+                    s = np.std(lb)
+                    z_series.append((spread_ltf[i] - np.mean(lb)) / s if s > 1e-10 else 0)
+                else:
+                    z_series.append((spread_ltf[i] - m) / d)
+            
+            if len(z_series) < 6:
+                return {'mtf_confirmed': None, 'mtf_reason': 'Недостаточно Z-серии'}
+            
+            # Velocity: средний dZ за последние 5 баров
+            recent_z = z_series[-6:]
+            dz = [recent_z[i+1] - recent_z[i] for i in range(len(recent_z)-1)]
+            z_velocity = np.mean(dz)
+            
+            # Price momentum на последних 3 барах
+            p1_mom = (p1[-1] - p1[-4]) / p1[-4] * 100 if len(p1) >= 4 else 0
+            p2_mom = (p2[-1] - p2[-4]) / p2[-4] * 100 if len(p2) >= 4 else 0
+            
+            # ═══════ CONFIRMATION LOGIC ═══════
+            checks = []
+            
+            # Check 1: Z-direction agreement
+            # Для LONG (primary_z < 0): 1h Z тоже должен быть < 0
+            # Для SHORT (primary_z > 0): 1h Z тоже должен быть > 0
+            z_agrees = (primary_z > 0 and current_z > 0) or (primary_z < 0 and current_z < 0)
+            checks.append(('Z-direction', z_agrees, f'{self.timeframe} Z={primary_z:+.2f}, {confirm_tf} Z={current_z:+.2f}'))
+            
+            # Check 2: Z-velocity toward zero (mean reversion started)
+            # LONG (Z<0): velocity > 0 (Z moving up toward 0)
+            # SHORT (Z>0): velocity < 0 (Z moving down toward 0)
+            if primary_direction == 'LONG':
+                z_reverting = z_velocity > 0.02  # Z moving up
+            elif primary_direction == 'SHORT':
+                z_reverting = z_velocity < -0.02  # Z moving down
+            else:
+                z_reverting = False
+            checks.append(('Z-velocity', z_reverting, f'dZ/dt={z_velocity:+.3f}/bar'))
+            
+            # Check 3: Z-magnitude — ещё не вернулся к нулю
+            z_still_away = abs(current_z) > 0.5
+            checks.append(('Z-magnitude', z_still_away, f'|Z|={abs(current_z):.2f} > 0.5'))
+            
+            # Check 4: Price momentum — первая монета двигается "правильно"
+            if primary_direction == 'LONG':
+                # LONG pair: coin1 should start outperforming coin2
+                mom_ok = (p1_mom - primary_hr * p2_mom) > -0.1  # spread не ухудшается
+            elif primary_direction == 'SHORT':
+                mom_ok = (p1_mom - primary_hr * p2_mom) < 0.1
+            else:
+                mom_ok = True
+            checks.append(('Momentum', mom_ok, f'Δ1={p1_mom:+.2f}%, Δ2={p2_mom:+.2f}%'))
+            
+            # Result
+            passed = sum(1 for _, ok, _ in checks if ok)
+            total = len(checks)
+            
+            if passed >= 3:
+                confirmed = True
+                strength = 'STRONG' if passed == 4 else 'OK'
+            elif passed == 2 and z_agrees:
+                confirmed = True
+                strength = 'WEAK'
+            else:
+                confirmed = False
+                strength = 'FAIL'
+            
+            return {
+                'mtf_confirmed': confirmed,
+                'mtf_strength': strength,
+                'mtf_tf': confirm_tf,
+                'mtf_z': round(current_z, 2),
+                'mtf_z_velocity': round(z_velocity, 3),
+                'mtf_checks': checks,
+                'mtf_passed': passed,
+                'mtf_total': total,
+                'mtf_p1_mom': round(p1_mom, 2),
+                'mtf_p2_mom': round(p2_mom, 2),
+                'mtf_reason': f'{passed}/{total} checks',
+            }
+        
+        except Exception as e:
+            return {'mtf_confirmed': None, 'mtf_reason': f'Ошибка: {str(e)[:60]}'}
+    
     def scan_pairs(self, coins, max_pairs=50, progress_bar=None, max_halflife_hours=720,
                    hide_stablecoins=True, corr_prefilter=0.3):
         """Сканировать все пары (v10.5: parallel download + stablecoin filter + correlation pre-filter)"""
@@ -822,7 +975,7 @@ def plot_spread_chart(spread_data, pair_name, zscore):
 # === ИНТЕРФЕЙС ===
 
 st.markdown('<p class="main-header">🔍 Crypto Pairs Trading Scanner</p>', unsafe_allow_html=True)
-st.caption("Версия 8.0 | Continuous Threshold + Hurst Hard Gate + Cluster Detection + Direction Conflicts")
+st.caption("Версия 10.0 | Multi-Timeframe Confirmation + Clean UI + Hurst Gate + Cluster Detection")
 st.markdown("---")
 
 # Sidebar - настройки
@@ -1017,6 +1170,23 @@ with st.sidebar:
     
     auto_refresh = st.checkbox("Автообновление", value=False, key='auto_refresh_check')
     
+    # v10.0: Multi-Timeframe Confirmation
+    st.markdown("---")
+    st.subheader("🔄 Multi-Timeframe")
+    mtf_enabled = st.checkbox(
+        "MTF подтверждение",
+        value=True,
+        help="Проверяет сигнал на младшем ТФ (4h→1h, 1d→4h). Добавляет ~30сек к скану.",
+        key='mtf_enabled'
+    )
+    if mtf_enabled:
+        confirm_tf_map = {'4h': '1h', '1d': '4h', '2h': '1h', '1h': None}
+        ctf = confirm_tf_map.get(timeframe)
+        if ctf:
+            st.caption(f"📊 {timeframe} сигнал → проверка на {ctf}")
+        else:
+            st.caption(f"⚪ {timeframe} — уже минимальный ТФ, MTF недоступен")
+    
     if auto_refresh:
         refresh_interval = st.slider(
             "Интервал обновления (минуты)",
@@ -1090,6 +1260,55 @@ if st.session_state.running or (auto_refresh and st.session_state.pairs_data is 
             
             progress_placeholder.empty()
             
+            # ═══════ v10.0: MULTI-TIMEFRAME CONFIRMATION ═══════
+            mtf_enabled = st.session_state.get('mtf_enabled', True)
+            confirm_tf = {'4h': '1h', '1d': '4h', '2h': '1h'}.get(timeframe)
+            
+            if mtf_enabled and confirm_tf and pairs_results:
+                # Только для SIGNAL и READY пар (не тратим время на WATCH/NEUTRAL)
+                mtf_candidates = [p for p in pairs_results 
+                                  if p.get('signal') in ('SIGNAL', 'READY') 
+                                  and p.get('direction', 'NONE') != 'NONE']
+                
+                if mtf_candidates:
+                    mtf_bar = st.progress(0, f"🔄 MTF подтверждение ({confirm_tf}) для {len(mtf_candidates)} пар...")
+                    
+                    for idx, p in enumerate(mtf_candidates):
+                        mtf_bar.progress((idx + 1) / len(mtf_candidates), 
+                                        f"🔄 MTF: {p['coin1']}/{p['coin2']} ({idx+1}/{len(mtf_candidates)})")
+                        
+                        mtf = scanner.mtf_confirm(
+                            p['coin1'], p['coin2'],
+                            primary_direction=p.get('direction', 'NONE'),
+                            primary_z=p.get('zscore', 0),
+                            primary_hr=p.get('hedge_ratio', 1.0)
+                        )
+                        
+                        # Добавляем MTF данные к результату пары
+                        if mtf:
+                            p.update({
+                                'mtf_confirmed': mtf.get('mtf_confirmed'),
+                                'mtf_strength': mtf.get('mtf_strength', ''),
+                                'mtf_tf': mtf.get('mtf_tf', confirm_tf),
+                                'mtf_z': mtf.get('mtf_z', None),
+                                'mtf_z_velocity': mtf.get('mtf_z_velocity', None),
+                                'mtf_checks': mtf.get('mtf_checks', []),
+                                'mtf_passed': mtf.get('mtf_passed', 0),
+                                'mtf_total': mtf.get('mtf_total', 0),
+                                'mtf_reason': mtf.get('mtf_reason', ''),
+                            })
+                        else:
+                            p['mtf_confirmed'] = None
+                        
+                        import time as _time
+                        _time.sleep(0.15)  # Rate limit protection
+                    
+                    mtf_bar.empty()
+                    
+                    confirmed_count = sum(1 for p in mtf_candidates if p.get('mtf_confirmed') == True)
+                    st.info(f"✅ MTF ({confirm_tf}): {confirmed_count}/{len(mtf_candidates)} пар подтверждены")
+            
+            # Store
             st.session_state.pairs_data = pairs_results
             st.session_state.last_update = datetime.now()
             st.session_state.running = False  # v7.1: КРИТИЧНО — без этого выбор пары перезапускает скан
@@ -1137,36 +1356,85 @@ if st.session_state.pairs_data is not None:
     
     if len(pairs) == 0:
         st.warning("⚠️ Коинтегрированных пар не найдено с текущими параметрами")
-        st.info("""
-        **Попробуйте:**
-        - Увеличить период анализа (60-90 дней)
-        - Увеличить P-value порог до 0.10
-        - Уменьшить количество монет (сфокусироваться на топ-20)
-        - Изменить таймфрейм на 4h или 1h
-        - Ослабить фильтры Hurst/OU
-        - Отключить FDR и Stability фильтры
-        """)
     else:
-        st.success(f"✅ Найдено {len(pairs)} коинтегрированных пар")
-    
-        # v6.0: Entry readiness summary
-        mc1, mc2, mc3, mc4, mc5, mc6, mc7 = st.columns(7)
-        mc1.metric("🟢 ВХОД", sum(1 for p in pairs if p.get('_entry_level') == 'ENTRY'))
-        mc2.metric("🟡 УСЛОВНО", sum(1 for p in pairs if p.get('_entry_level') == 'CONDITIONAL'))
-        mc3.metric("⚪ ЖДАТЬ", sum(1 for p in pairs if p.get('_entry_level') == 'WAIT'))
-        mc4.metric("🔴 SIGNAL", sum(1 for p in pairs if p['signal'] == 'SIGNAL'))
-        mc5.metric("🟡 READY", sum(1 for p in pairs if p['signal'] == 'READY'))
-        mc6.metric("👁 WATCH", sum(1 for p in pairs if p['signal'] == 'WATCH'))
-        mc7.metric("⭐ HIGH conf", sum(1 for p in pairs if p.get('confidence') == 'HIGH'))
+        # ═══════ v9.0: CLEAN UI — ACTION PANEL FIRST ═══════
+        scan_time = st.session_state.get('last_update', datetime.now())
         
-        st.markdown("---")
+        # Separate by entry level
+        entry_pairs = [p for p in pairs if p.get('_entry_level') == 'ENTRY']
+        cond_pairs = [p for p in pairs if p.get('_entry_level') == 'CONDITIONAL']
+        wait_pairs = [p for p in pairs if p.get('_entry_level') == 'WAIT']
         
-        # ═══════ v8.0: CLUSTER DETECTION + DIRECTION CONFLICTS ═══════
+        # ═══ 1. ACTION PANEL — READY TO TRADE ═══
+        if entry_pairs:
+            st.markdown("## 🟢 ГОТОВЫ К ВХОДУ")
+            for p in entry_pairs:
+                d = p.get('direction', 'NONE')
+                c1, c2 = p['coin1'], p['coin2']
+                if d == 'LONG':
+                    c1_act, c2_act = '🟢 КУПИТЬ', '🔴 ПРОДАТЬ'
+                elif d == 'SHORT':
+                    c1_act, c2_act = '🔴 ПРОДАТЬ', '🟢 КУПИТЬ'
+                else:
+                    c1_act, c2_act = '⚪', '⚪'
+                
+                # v10.0: MTF badge
+                mtf_conf = p.get('mtf_confirmed')
+                if mtf_conf is True:
+                    mtf_str = p.get('mtf_strength', 'OK')
+                    mtf_badge = f"✅ MTF {p.get('mtf_tf', '1h')} ({mtf_str})"
+                    mtf_color = 'green'
+                elif mtf_conf is False:
+                    mtf_badge = f"❌ MTF {p.get('mtf_tf', '1h')} не подтв."
+                    mtf_color = 'red'
+                else:
+                    mtf_badge = ""
+                    mtf_color = 'gray'
+                
+                with st.container():
+                    ac1, ac2, ac3, ac4, ac5 = st.columns([3, 2, 2, 2, 2])
+                    dir_arrow = '🟢↑' if d == 'LONG' else '🔴↓'
+                    ac1.markdown(f"### **{p['pair']}** {dir_arrow}")
+                    ac2.metric("Z-Score", f"{p['zscore']:+.2f}", f"Порог: {p.get('threshold', 2.0)}")
+                    ac3.metric("Quality", f"{p.get('quality_score', 0)}/100")
+                    ac4.metric("Hurst", f"{p.get('hurst', 0.5):.3f}")
+                    ac5.metric("HR", f"{p['hedge_ratio']:.4f}")
+                    
+                    info_line = f"**{c1}**: {c1_act} | **{c2}**: {c2_act} | **HR:** 1:{p['hedge_ratio']:.4f} | **HL:** {p.get('halflife_hours', p['halflife_days']*24):.0f}ч | **ρ:** {p.get('correlation', 0):.2f}"
+                    
+                    if mtf_badge:
+                        info_line += f" | **{mtf_badge}**"
+                        if mtf_conf is True:
+                            mtf_z = p.get('mtf_z')
+                            mtf_vel = p.get('mtf_z_velocity')
+                            if mtf_z is not None:
+                                info_line += f" (Z={mtf_z:+.2f}, dZ={mtf_vel:+.3f}/bar)"
+                    
+                    st.markdown(info_line)
+                    
+                    # MTF warning if not confirmed
+                    if mtf_conf is False:
+                        st.warning(f"⚠️ {p.get('mtf_tf', '1h')} не подтверждает: {p.get('mtf_reason', '')}. "
+                                   f"Рассмотрите отложенный вход.")
+                    
+                    st.markdown("---")
+        else:
+            st.info("⚪ Нет пар готовых к входу (🟢 ВХОД). Дождитесь сигнала или ослабьте фильтры.")
+        
+        # ═══ 2. SUMMARY METRICS ═══
+        with st.expander(f"📊 Сводка ({len(pairs)} пар) | Последнее сканирование: {scan_time.strftime('%H:%M:%S %d.%m.%Y')}", expanded=False):
+            mc1, mc2, mc3, mc4 = st.columns(4)
+            mc1.metric("🟢 ВХОД", len(entry_pairs))
+            mc2.metric("🟡 УСЛОВНО", len(cond_pairs))
+            mc3.metric("⚪ ЖДАТЬ", len(wait_pairs))
+            mc4.metric("⭐ HIGH conf", sum(1 for p in pairs if p.get('confidence') == 'HIGH'))
+        
+        # ═══ 3. CLUSTER + CONFLICT WARNINGS ═══
         signal_pairs = [p for p in pairs if p.get('signal') in ('SIGNAL', 'READY')]
         if signal_pairs:
             from collections import Counter
             coin_count = Counter()
-            coin_dirs = {}  # coin → set of actions (LONG/SHORT)
+            coin_dirs = {}
             
             for p in signal_pairs:
                 c1, c2 = p['coin1'], p['coin2']
@@ -1180,29 +1448,16 @@ if st.session_state.pairs_data is not None:
                     coin_dirs.setdefault(c1, set()).add('SHORT')
                     coin_dirs.setdefault(c2, set()).add('LONG')
             
-            # Cluster warnings
             clusters = [(c, n) for c, n in coin_count.most_common() if n >= 3]
             if clusters:
-                cluster_msg = "⚠️ **Кластеры (монета в 3+ парах):** "
-                cluster_msg += ", ".join([f"**{c}** ({n} пар)" for c, n in clusters])
-                cluster_msg += "\n\nТорговля несколькими парами с одной монетой = завышенный риск. Это НЕ независимые сделки!"
-                st.warning(cluster_msg)
+                st.warning("⚠️ **Кластеры:** " + ", ".join([f"**{c}** ({n} пар)" for c, n in clusters]) + " — это НЕ независимые сделки!")
             
-            # Direction conflicts
             conflicts = [(c, dirs) for c, dirs in coin_dirs.items() if len(dirs) > 1]
             if conflicts:
-                conflict_msg = "🚨 **Конфликты направления:**\n"
-                for c, dirs in conflicts:
-                    conflict_pairs_long = [p['pair'] for p in signal_pairs if (p['coin1'] == c and p.get('direction') == 'LONG') or (p['coin2'] == c and p.get('direction') == 'SHORT')]
-                    conflict_pairs_short = [p['pair'] for p in signal_pairs if (p['coin1'] == c and p.get('direction') == 'SHORT') or (p['coin2'] == c and p.get('direction') == 'LONG')]
-                    conflict_msg += f"\n**{c}**: LONG в {conflict_pairs_long}, SHORT в {conflict_pairs_short}"
-                conflict_msg += "\n\nОдна монета одновременно LONG и SHORT → позиции частично гасят друг друга. Выберите лучшую пару!"
-                st.error(conflict_msg)
+                st.error("🚨 **Конфликт:** " + ", ".join([f"**{c}** (LONG+SHORT)" for c, _ in conflicts]) + " — монета в обе стороны одновременно")
         
-        st.markdown("---")
-        
-        # Таблица результатов
-        st.subheader("📊 Коинтегрированные пары")
+        # ═══ 4. FULL TABLE ═══
+        st.subheader(f"📊 Коинтегрированные пары | Скан: {scan_time.strftime('%H:%M:%S')}")
         
         st.info("💡 **Кликните на строку** | 🟢 ВХОД = все обязательные ОК | 🟡 УСЛОВНО = обяз. ОК но мало желательных | ⚪ ЖДАТЬ = не входить")
     
@@ -1213,6 +1468,9 @@ if st.session_state.pairs_data is not None:
             'Вход': p.get('_entry_label', '⚪ ЖДАТЬ'),
             'Статус': p['signal'],
             'Dir': p.get('direction', ''),
+            'MTF': ('✅' if p.get('mtf_confirmed') == True 
+                    else '❌' if p.get('mtf_confirmed') == False 
+                    else '—'),
             'Q': p.get('quality_score', 0),
             'S': p.get('signal_score', 0),
             'Conf': p.get('confidence', '?'),
@@ -1233,7 +1491,7 @@ if st.session_state.pairs_data is not None:
         } for p in pairs])
     else:
         df_display = pd.DataFrame(columns=[
-            'Пара', 'Вход', 'Статус', 'Dir', 'Q', 'S', 'Conf', 'Z', 'Thr',
+            'Пара', 'Вход', 'Статус', 'Dir', 'MTF', 'Q', 'S', 'Conf', 'Z', 'Thr',
             'FDR', 'Hurst', 'Stab', 'HL', 'HR', 'ρ', 'Opt'
         ])
     
@@ -1293,107 +1551,89 @@ if st.session_state.pairs_data is not None:
     if ea['level'] == 'ENTRY':
         st.markdown(f'<div class="entry-ready">🟢 ГОТОВ К ВХОДУ — все обязательные ОК + {ea["opt_count"]}/6 желательных</div>', unsafe_allow_html=True)
     elif ea['level'] == 'CONDITIONAL':
-        st.markdown(f'<div class="entry-conditional">🟡 УСЛОВНЫЙ ВХОД — обязательные ОК, {ea["opt_count"]}/6 желательных</div>', unsafe_allow_html=True)
+        st.markdown(f'<div class="entry-conditional">🟡 УСЛОВНЫЙ — {ea["opt_count"]}/6 желательных</div>', unsafe_allow_html=True)
     else:
-        st.markdown(f'<div class="entry-wait">⚪ НЕ ВХОДИТЬ — не все обязательные критерии выполнены</div>', unsafe_allow_html=True)
+        st.markdown(f'<div class="entry-wait">⚪ НЕ ВХОДИТЬ</div>', unsafe_allow_html=True)
     
-    chk1, chk2 = st.columns(2)
-    with chk1:
-        st.markdown("**🟢 Обязательные (все = ✅):**")
-        for name, met, val in ea['mandatory']:
-            st.markdown(f"  {'✅' if met else '❌'} **{name}** → `{val}`")
-    with chk2:
-        st.markdown("**🔵 Желательные (больше = лучше):**")
-        for name, met, val in ea['optional']:
-            st.markdown(f"  {'✅' if met else '⬜'} {name} → `{val}`")
-        if ea['fdr_bypass']:
-            st.info("🟡 **FDR bypass:** Q≥70 + Stab≥3/4 + ADF✅ + Hurst<0.35")
-    
-    # ═══════ ЗАГОЛОВОК С АДАПТИВНЫМ СИГНАЛОМ ═══════
+    # v9.0: Compact key metrics
     state = selected_data.get('signal', 'NEUTRAL')
     direction = selected_data.get('direction', 'NONE')
     conf = selected_data.get('confidence', '?')
     threshold = selected_data.get('threshold', 2.0)
-    
-    state_emoji = {'SIGNAL': '🔴', 'READY': '🟡', 'WATCH': '👁', 'NEUTRAL': '⚪'}.get(state, '⚪')
-    conf_emoji = {'HIGH': '⭐', 'MEDIUM': '🔵', 'LOW': '⚫'}.get(conf, '⚫')
     dir_emoji = {'LONG': '🟢↑', 'SHORT': '🔴↓', 'NONE': ''}.get(direction, '')
     
-    st.markdown(f"### {state_emoji} **{state}** {dir_emoji} | {conf_emoji} {conf} | **{selected_pair}**")
+    km1, km2, km3, km4, km5 = st.columns(5)
+    km1.metric("Z-Score", f"{selected_data['zscore']:+.2f}", f"Порог: ±{threshold}")
+    km2.metric("Quality", f"{selected_data.get('quality_score', 0)}/100", f"{conf}")
+    km3.metric("Hurst", f"{selected_data.get('hurst', 0.5):.3f}", 
+               "✅ MR" if selected_data.get('hurst', 0.5) < 0.35 else "⚠️" if selected_data.get('hurst', 0.5) < 0.45 else "❌ No MR")
+    km4.metric("Half-life", f"{selected_data.get('halflife_hours', selected_data['halflife_days']*24):.0f}ч")
+    km5.metric("Корреляция", f"{selected_data.get('correlation', 0):.2f}")
     
-    if state == 'SIGNAL':
-        st.success(f"🎯 **ВХОД {direction}** | Z={selected_data['zscore']:.2f} | Порог для этой пары: |Z| ≥ {threshold}")
-    elif state == 'READY':
-        st.info(f"⏳ **ГОТОВНОСТЬ {direction}** | Z={selected_data['zscore']:.2f} | До порога ({threshold}): {abs(threshold - abs(selected_data['zscore'])):.2f}")
-    elif state == 'WATCH':
-        st.info(f"👁 **МОНИТОРИНГ** | Z={selected_data['zscore']:.2f} | Порог: {threshold}")
+    # v9.0: Entry/Exit info in expander
+    with st.expander("📋 Критерии входа", expanded=ea['level'] == 'ENTRY'):
+        chk1, chk2 = st.columns(2)
+        with chk1:
+            st.markdown("**🟢 Обязательные (все = ✅):**")
+            for name, met, val in ea['mandatory']:
+                st.markdown(f"  {'✅' if met else '❌'} **{name}** → `{val}`")
+        with chk2:
+            st.markdown("**🔵 Желательные (больше = лучше):**")
+            for name, met, val in ea['optional']:
+                st.markdown(f"  {'✅' if met else '⬜'} {name} → `{val}`")
+            if ea['fdr_bypass']:
+                st.info("🟡 **FDR bypass активен**")
     
-    # ⚠️ Предупреждения
+    # ⚠️ Предупреждения (keep visible)
     warnings_list = []
     if selected_data.get('hurst_is_fallback', False):
         warnings_list.append("⚠️ Hurst = 0.5 (DFA fallback — данных недостаточно)")
     if abs(selected_data['zscore']) > 5:
-        warnings_list.append(f"⚠️ |Z| = {abs(selected_data['zscore']):.1f} > 5 — аномалия")
-    elif selected_data.get('z_warning', False):
-        warnings_list.append(f"⚠️ |Z| = {abs(selected_data['zscore']):.1f} > 4.0 — приближается к аномалии, возможен структурный сдвиг")
+        warnings_list.append(f"⚠️ |Z| > 5 — аномалия")
     if not selected_data.get('fdr_passed', False) and not ea.get('fdr_bypass', False):
-        warnings_list.append("⚠️ FDR не пройден (и bypass не активен)")
-    if not selected_data.get('adf_passed', False):
-        warnings_list.append("⚠️ ADF: спред нестационарен")
-    n_bars = selected_data.get('n_bars', 0)
-    if 0 < n_bars < 100:
-        warnings_list.append(f"⚠️ Мало данных: {n_bars} баров (< 100). Результаты менее надёжны")
+        warnings_list.append("⚠️ FDR не пройден")
     if warnings_list:
-        st.warning("\n".join(warnings_list))
+        st.warning(" | ".join(warnings_list))
     
-    # ═══════ DUAL SCORE: Quality + Signal ═══════
-    q_score = selected_data.get('quality_score', 0)
-    s_score = selected_data.get('signal_score', 0)
-    q_bd = selected_data.get('quality_breakdown', {})
-    s_bd = selected_data.get('signal_breakdown', {})
+    # ═══════ v10.0: MTF CONFIRMATION PANEL ═══════
+    mtf_conf = selected_data.get('mtf_confirmed')
+    if mtf_conf is not None:
+        st.markdown("---")
+        mtf_tf = selected_data.get('mtf_tf', '1h')
+        mtf_strength = selected_data.get('mtf_strength', '')
+        mtf_z = selected_data.get('mtf_z')
+        mtf_vel = selected_data.get('mtf_z_velocity')
+        mtf_passed = selected_data.get('mtf_passed', 0)
+        mtf_total = selected_data.get('mtf_total', 0)
+        
+        if mtf_conf:
+            badge_color = 'entry-ready' if mtf_strength in ('STRONG', 'OK') else 'entry-conditional'
+            st.markdown(f'<div class="{badge_color}">✅ MTF ПОДТВЕРЖДЕНО ({mtf_tf}) — {mtf_strength} ({mtf_passed}/{mtf_total})</div>', unsafe_allow_html=True)
+        else:
+            st.markdown(f'<div class="entry-wait">❌ MTF НЕ ПОДТВЕРЖДЕНО ({mtf_tf}) — {mtf_passed}/{mtf_total} проверок</div>', unsafe_allow_html=True)
+        
+        mtf_checks = selected_data.get('mtf_checks', [])
+        if mtf_checks:
+            mc1, mc2 = st.columns(2)
+            with mc1:
+                if mtf_z is not None:
+                    st.metric(f"Z-Score ({mtf_tf})", f"{mtf_z:+.2f}")
+            with mc2:
+                if mtf_vel is not None:
+                    vel_dir = '↑к0' if mtf_vel > 0 else '↓к0' if mtf_vel < 0 else '→'
+                    st.metric(f"Z-Velocity ({mtf_tf})", f"{mtf_vel:+.3f}/bar", vel_dir)
+            
+            with st.expander(f"🔄 MTF Проверки ({mtf_tf})", expanded=False):
+                for name, passed, detail in mtf_checks:
+                    st.markdown(f"{'✅' if passed else '❌'} **{name}** — {detail}")
+                
+                if not mtf_conf:
+                    st.warning(f"💡 Рассмотрите отложенный вход. Дождитесь когда {mtf_tf} Z начнёт двигаться к нулю.")
     
-    score_col1, score_col2 = st.columns(2)
-    
-    with score_col1:
-        q_emoji = "🟢" if q_score >= 60 else "🟡" if q_score >= 40 else "🔴"
-        st.metric(f"{q_emoji} Quality Score", f"{q_score}/100", 
-                  "Надёжность пары")
-        if q_bd:
-            st.caption(" | ".join([f"{k}:{v}" for k, v in q_bd.items()]))
-    
-    with score_col2:
-        s_emoji = "🟢" if s_score >= 60 else "🟡" if s_score >= 30 else "⚪"
-        st.metric(f"{s_emoji} Signal Score", f"{s_score}/100",
-                  "Момент входа")
-        if s_bd:
-            st.caption(" | ".join([f"{k}:{v}" for k, v in s_bd.items()]))
-    
-    # ═══════ МЕТРИКИ ═══════
-    col1, col2, col3, col4, col5, col6 = st.columns(6)
-    
-    with col1:
-        z_str = f"{selected_data['zscore']:.2f}"
-        if selected_data.get('z_warning', False):
-            z_str += " ⚠️"
-        st.metric("Z-Score", z_str)
-    with col2:
-        st.metric("P-adj", f"{selected_data.get('pvalue_adj', selected_data['pvalue']):.4f}")
-    with col3:
-        hl_hours = selected_data.get('halflife_hours', selected_data['halflife_days'] * 24)
-        st.metric("Half-life", f"{hl_hours:.1f}ч" if hl_hours < 48 else "∞")
-    with col4:
-        st.metric("Confidence", f"{conf} ({selected_data.get('conf_checks', 0)}/{selected_data.get('conf_total', 6)})")
-    with col5:
-        st.metric("Порог Z", f"±{threshold}")
-    with col6:
-        n_bars = selected_data.get('n_bars', 0)
-        bars_emoji = "🟢" if n_bars >= 300 else "🟡" if n_bars >= 100 else "🔴"
-        st.metric("Баров", f"{n_bars} {bars_emoji}")
-    
-    # ═══════ MEAN REVERSION ANALYSIS v8.0 ═══════
+    # ═══════ MEAN REVERSION ANALYSIS ═══════
     if 'hurst' in selected_data and 'theta' in selected_data:
         st.markdown("---")
-        st.subheader("🔬 Mean Reversion Analysis (v10.5)")
+        st.subheader("🔬 Детальная статистика")
         
         col1, col2, col3, col4 = st.columns(4)
         
@@ -1676,7 +1916,15 @@ if st.session_state.pairs_data is not None:
     
     rec_direction = selected_data.get('direction', 'NONE')
     rec_thr = selected_data.get('threshold', 2.0)
-    adaptive_stop = max(rec_thr + 2.0, 4.0)  # v8.0: stop всегда на 2 Z-единицы дальше порога
+    adaptive_stop = max(rec_thr + 2.0, 4.0)
+    
+    # v10.0: MTF status for recommendation
+    mtf_rec = selected_data.get('mtf_confirmed')
+    mtf_line = ""
+    if mtf_rec is True:
+        mtf_line = f"\n        - ✅ **MTF ({selected_data.get('mtf_tf', '1h')}):** подтверждено ({selected_data.get('mtf_strength', '')})"
+    elif mtf_rec is False:
+        mtf_line = f"\n        - ⚠️ **MTF ({selected_data.get('mtf_tf', '1h')}):** НЕ подтверждено — рассмотрите отложенный вход"
     
     if rec_direction == 'LONG':
         st.success(f"""
@@ -1685,7 +1933,7 @@ if st.session_state.pairs_data is not None:
         - 🔴 **ПРОДАТЬ** {selected_data['coin2']} (шорт)
         - **Соотношение:** 1:{selected_data['hedge_ratio']:.4f}
         - **Таргет:** Z-score → 0 (mean revert)
-        - **Стоп-лосс:** Z < -{adaptive_stop:.1f} (адаптивный: порог {rec_thr} + 2.0)
+        - **Стоп-лосс:** Z < -{adaptive_stop:.1f} (адаптивный: порог {rec_thr} + 2.0){mtf_line}
         """)
     elif rec_direction == 'SHORT':
         st.error(f"""
@@ -1694,7 +1942,7 @@ if st.session_state.pairs_data is not None:
         - 🟢 **КУПИТЬ** {selected_data['coin2']}
         - **Соотношение:** 1:{selected_data['hedge_ratio']:.4f}
         - **Таргет:** Z-score → 0 (mean revert)
-        - **Стоп-лосс:** Z > +{adaptive_stop:.1f} (адаптивный: порог {rec_thr} + 2.0)
+        - **Стоп-лосс:** Z > +{adaptive_stop:.1f} (адаптивный: порог {rec_thr} + 2.0){mtf_line}
         """)
     else:
         st.info("⚪ Нет активного сигнала. Дождитесь |Z-score| > порога")
@@ -1702,6 +1950,20 @@ if st.session_state.pairs_data is not None:
     # v8.0: Детальный анализ пары — CSV export
     st.markdown("---")
     st.markdown("### 📥 Экспорт детального анализа пары")
+    
+    # v10.0: MTF data for detail export
+    mtf_params = []
+    mtf_values = []
+    if selected_data.get('mtf_confirmed') is not None:
+        mtf_params.extend(['MTF Confirmed', 'MTF Strength', 'MTF TF', 'MTF Z-Score', 'MTF Z-Velocity', 'MTF Checks'])
+        mtf_values.extend([
+            '✅ YES' if selected_data.get('mtf_confirmed') else '❌ NO',
+            selected_data.get('mtf_strength', ''),
+            selected_data.get('mtf_tf', ''),
+            selected_data.get('mtf_z', ''),
+            selected_data.get('mtf_z_velocity', ''),
+            f"{selected_data.get('mtf_passed', 0)}/{selected_data.get('mtf_total', 0)}",
+        ])
     
     detail_data = {
         'Параметр': [
@@ -1713,7 +1975,7 @@ if st.session_state.pairs_data is not None:
             'Stability', 'Crossing Density', 'Z-window',
             'Kalman HR', 'N баров',
             f'{selected_data["coin1"]} Action', f'{selected_data["coin2"]} Action',
-        ],
+        ] + mtf_params,
         'Значение': [
             selected_data['pair'],
             selected_data.get('direction', 'NONE'),
@@ -1741,7 +2003,7 @@ if st.session_state.pairs_data is not None:
             selected_data.get('n_bars', 0),
             'LONG (КУПИТЬ)' if rec_direction == 'LONG' else ('SHORT (ПРОДАТЬ)' if rec_direction == 'SHORT' else '-'),
             'SHORT (ПРОДАТЬ)' if rec_direction == 'LONG' else ('LONG (КУПИТЬ)' if rec_direction == 'SHORT' else '-'),
-        ]
+        ] + mtf_values
     }
     df_detail = pd.DataFrame(detail_data)
     csv_detail = df_detail.to_csv(index=False)
@@ -1791,6 +2053,11 @@ if st.session_state.pairs_data is not None:
             'Opt_criteria': f"{p.get('_opt_count', 0)}/6",
             'FDR_bypass': p.get('_fdr_bypass', False),
             'Cluster': p.get('cluster', ''),
+            'MTF_confirmed': p.get('mtf_confirmed', ''),
+            'MTF_strength': p.get('mtf_strength', ''),
+            'MTF_Z': p.get('mtf_z', ''),
+            'MTF_velocity': p.get('mtf_z_velocity', ''),
+            'MTF_checks': f"{p.get('mtf_passed', '')}/{p.get('mtf_total', '')}",
         })
     
     df_export = pd.DataFrame(export_rows)
