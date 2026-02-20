@@ -535,7 +535,7 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 st.title("📍 Pairs Position Monitor")
-st.caption("v5.0 | Синхр. со сканером v9.0 | Hurst Gate + Adaptive Stop + CSV Export")
+st.caption("v5.1 | Синхр. со сканером v10.0 | Hurst Gate + Adaptive Stop + MTF + CSV Export")
 
 # Sidebar
 with st.sidebar:
