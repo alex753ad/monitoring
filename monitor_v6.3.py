@@ -13,7 +13,11 @@ import ccxt
 import time
 import json
 import os
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
+
+MSK = timezone(timedelta(hours=3))
+def now_msk():
+    return datetime.now(MSK)
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 from statsmodels.tsa.stattools import coint
@@ -26,6 +30,7 @@ try:
         calculate_hurst_exponent,
         assess_entry_readiness,
         calc_halflife_from_spread,
+        check_pnl_z_disagreement,
     )
     _USE_MRA = True
 except ImportError:
@@ -240,7 +245,7 @@ def add_position(coin1, coin2, direction, entry_z, entry_hr,
         'entry_hr': entry_hr,
         'entry_price1': entry_price1,
         'entry_price2': entry_price2,
-        'entry_time': datetime.now().isoformat(),
+        'entry_time': now_msk().isoformat(),
         'timeframe': timeframe,
         'status': 'OPEN',
         'notes': notes,
@@ -262,7 +267,7 @@ def close_position(pos_id, exit_price1, exit_price2, exit_z, reason):
             p['exit_price1'] = exit_price1
             p['exit_price2'] = exit_price2
             p['exit_z'] = exit_z
-            p['exit_time'] = datetime.now().isoformat()
+            p['exit_time'] = now_msk().isoformat()
             p['exit_reason'] = reason
             # P&L
             r1 = (exit_price1 - p['entry_price1']) / p['entry_price1']
@@ -370,7 +375,11 @@ def monitor_position(pos, exchange_name):
     z_now = float(zs[~np.isnan(zs)][-1]) if any(~np.isnan(zs)) else 0
     
     # v3.0: Quality metrics (как в сканере)
-    hurst = calc_hurst(spread)
+    # v14: CRITICAL FIX — use SAME Hurst as scanner (DFA on increments)
+    if _USE_MRA:
+        hurst = calculate_hurst_exponent(spread)
+    else:
+        hurst = calc_hurst(spread)  # fallback (different algorithm!)
     corr = calc_correlation(p1, p2, window=min(60, len(p1) // 3))
     pvalue = calc_cointegration_pvalue(p1, p2)
     
@@ -415,26 +424,38 @@ def monitor_position(pos, exchange_name):
     z_towards_zero = abs(z_now) < abs(z_entry)  # Z двигается к 0 = в нашу пользу
     
     # v4.0: Предупреждение при расхождении P&L и Z-направления
+    # v14: Enhanced with variance collapse detection (рассуждение #1)
     pnl_z_disagree = False
     pnl_z_warning = ""
-    if pnl_pct > 0 and not z_towards_zero:
-        pnl_z_disagree = True
-        pnl_z_warning = (
-            f"⚠️ P&L положительный (+{pnl_pct:.2f}%), но Z ушёл дальше от нуля "
-            f"({z_entry:+.2f} → {z_now:+.2f}). "
-            f"Причина: Kalman HR изменился ({pos['entry_hr']:.4f} → {hr_current:.4f}), "
-            f"Z-окно сдвинулось. Цена P&L корректен, но спред ещё не вернулся."
-        )
-    elif pnl_pct < -0.5 and z_towards_zero:
-        pnl_z_disagree = True
-        pnl_z_warning = (
-            f"⚠️ Z движется к нулю ({z_entry:+.2f} → {z_now:+.2f}), но P&L отрицательный "
-            f"({pnl_pct:+.2f}%). Причина: HR сдвинулся, spread definition изменился."
-        )
+    
+    # Use shared function if available
+    if _USE_MRA:
+        disagree_info = check_pnl_z_disagreement(z_entry, z_now, pnl_pct, pos['direction'])
+        if disagree_info.get('disagreement'):
+            pnl_z_disagree = True
+            pnl_z_warning = disagree_info.get('warning', '')
+    
+    # Legacy checks (still useful as fallback)
+    if not pnl_z_disagree:
+        if pnl_pct > 0 and not z_towards_zero:
+            pnl_z_disagree = True
+            pnl_z_warning = (
+                f"⚠️ P&L положительный (+{pnl_pct:.2f}%), но Z ушёл дальше от нуля "
+                f"({z_entry:+.2f} → {z_now:+.2f}). "
+                f"HR изменился ({pos['entry_hr']:.4f} → {hr_current:.4f})."
+            )
+        elif pnl_pct < -0.5 and z_towards_zero:
+            pnl_z_disagree = True
+            pnl_z_warning = (
+                f"⚠️ Z → 0 ({z_entry:+.2f} → {z_now:+.2f}), но P&L={pnl_pct:+.2f}%. "
+                f"Возможно ложное схождение (σ спреда выросла)."
+            )
     
     # Time in trade (вычисляем ДО использования)
     entry_dt = datetime.fromisoformat(pos['entry_time'])
-    hours_in = (datetime.now() - entry_dt).total_seconds() / 3600
+    if entry_dt.tzinfo is None:
+        entry_dt = entry_dt.replace(tzinfo=MSK)  # assume MSK if no tz
+    hours_in = (now_msk() - entry_dt).total_seconds() / 3600
     
     # Exit signals
     exit_signal = None
@@ -540,7 +561,7 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 st.title("📍 Pairs Position Monitor")
-st.caption("v7.0 | 21.02.2026 | Hurst noise fix + Full CSV + DRY imports")
+st.caption("v9.0 | 21.02.2026 | Hurst DFA FIX + PnL/Z disagree + Moscow time")
 
 # Sidebar
 with st.sidebar:
@@ -810,7 +831,7 @@ with tab1:
         if open_rows:
             csv_open = pd.DataFrame(open_rows).to_csv(index=False)
             st.download_button("📥 Скачать открытые позиции (CSV)", csv_open,
-                f"positions_open_{datetime.now().strftime('%Y%m%d_%H%M')}.csv", "text/csv",
+                f"positions_open_{now_msk().strftime('%Y%m%d_%H%M')}.csv", "text/csv",
                 key="open_pos_csv")
 
 with tab2:
@@ -848,9 +869,9 @@ with tab2:
         csv_history = pd.DataFrame(rows).to_csv(index=False)
         # Date range from trades
         dates = [p.get('exit_time', '')[:10] for p in closed_positions if p.get('exit_time')]
-        date_suffix = dates[-1] if dates else datetime.now().strftime('%Y-%m-%d')
+        date_suffix = dates[-1] if dates else now_msk().strftime('%Y-%m-%d')
         st.download_button("📥 Скачать историю сделок (CSV)", csv_history,
-                          f"trades_history_{date_suffix}_{datetime.now().strftime('%H%M')}.csv", "text/csv")
+                          f"trades_history_{date_suffix}_{now_msk().strftime('%H%M')}.csv", "text/csv")
 
 # Auto refresh
 if auto_refresh:
