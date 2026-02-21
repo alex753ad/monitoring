@@ -28,6 +28,8 @@ from statsmodels.tsa.stattools import coint
 try:
     from mean_reversion_analysis import (
         calculate_hurst_exponent,
+        calculate_hurst_ema,
+        calculate_adaptive_robust_zscore,
         assess_entry_readiness,
         calc_halflife_from_spread,
         check_pnl_z_disagreement,
@@ -370,16 +372,26 @@ def monitor_position(pos, exchange_name):
     hl_days = calc_halflife(spread, dt=dt_ou)
     hl_hours = hl_days * 24 if hl_days < 999 else 999
     hl_bars = (hl_hours / hpb) if hl_hours < 999 else None
-    zs, zw = calc_zscore(spread, halflife_bars=hl_bars)
     
-    z_now = float(zs[~np.isnan(zs)][-1]) if any(~np.isnan(zs)) else 0
+    # v15: Use SAME Z-score function as scanner for consistency
+    if _USE_MRA:
+        z_now, zs, zw = calculate_adaptive_robust_zscore(spread, halflife_bars=hl_bars)
+    else:
+        zs, zw = calc_zscore(spread, halflife_bars=hl_bars)
+        z_now = float(zs[~np.isnan(zs)][-1]) if any(~np.isnan(zs)) else 0
     
     # v3.0: Quality metrics (как в сканере)
     # v14: CRITICAL FIX — use SAME Hurst as scanner (DFA on increments)
+    # v16: Hurst EMA smoothing
     if _USE_MRA:
-        hurst = calculate_hurst_exponent(spread)
+        hurst_ema_info = calculate_hurst_ema(spread)
+        hurst = hurst_ema_info.get('hurst_ema', 0.5)  # Use EMA, not raw
+        hurst_raw = hurst_ema_info.get('hurst_raw', hurst)
+        hurst_std = hurst_ema_info.get('hurst_std', 0)
     else:
-        hurst = calc_hurst(spread)  # fallback (different algorithm!)
+        hurst = calc_hurst(spread)  # fallback
+        hurst_raw = hurst
+        hurst_std = 0
     corr = calc_correlation(p1, p2, window=min(60, len(p1) // 3))
     pvalue = calc_cointegration_pvalue(p1, p2)
     
@@ -469,8 +481,14 @@ def monitor_position(pos, exchange_name):
     
     if pos['direction'] == 'LONG':
         if z_now >= -ez and z_now <= ez:
-            exit_signal = '✅ MEAN REVERT — закрывать!'
-            exit_urgency = 2
+            # v16: Check PnL before declaring convergence (рассуждение #1)
+            if pnl_pct > -0.3:  # Real convergence: Z→0 AND PnL not negative
+                exit_signal = '✅ MEAN REVERT — закрывать!'
+                exit_urgency = 2
+            else:
+                exit_signal = (f'⚠️ ЛОЖНОЕ СХОЖДЕНИЕ: Z→0 но P&L={pnl_pct:+.2f}%. '
+                               f'σ спреда выросла. Ждите реального возврата цен или таймаут.')
+                exit_urgency = 1
         elif z_now > 1.0:
             exit_signal = '✅ OVERSHOOT — фиксировать прибыль!'
             exit_urgency = 2
@@ -479,8 +497,14 @@ def monitor_position(pos, exchange_name):
             exit_urgency = 2
     else:
         if z_now <= ez and z_now >= -ez:
-            exit_signal = '✅ MEAN REVERT — закрывать!'
-            exit_urgency = 2
+            # v16: Check PnL before declaring convergence
+            if pnl_pct > -0.3:
+                exit_signal = '✅ MEAN REVERT — закрывать!'
+                exit_urgency = 2
+            else:
+                exit_signal = (f'⚠️ ЛОЖНОЕ СХОЖДЕНИЕ: Z→0 но P&L={pnl_pct:+.2f}%. '
+                               f'σ спреда выросла. Ждите реального возврата цен или таймаут.')
+                exit_urgency = 1
         elif z_now < -1.0:
             exit_signal = '✅ OVERSHOOT — фиксировать прибыль!'
             exit_urgency = 2
@@ -502,14 +526,16 @@ def monitor_position(pos, exchange_name):
         exit_signal = f'⚠️ Позиция открыта {hours_in:.0f}ч (лимит {max_hours:.0f}ч)'
         exit_urgency = 1
     
-    # v5.3: Quality warnings (relaxed threshold — DFA noisy near 0.45-0.50)
+    # v5.3: Quality warnings (v16: uses EMA Hurst)
     quality_warnings = []
     if hurst >= 0.50:
-        quality_warnings.append(f"🚨 Hurst={hurst:.3f} ≥ 0.50 — DFA fallback, нет mean reversion!")
+        quality_warnings.append(
+            f"🚨 Hurst(EMA)={hurst:.3f} ≥ 0.50 — нет mean reversion!"
+            + (f" (raw={hurst_raw:.3f}, σ={hurst_std:.3f})" if hurst_std > 0 else ""))
     elif hurst >= 0.48:
-        quality_warnings.append(f"⚠️ Hurst={hurst:.3f} ≥ 0.48 — mean reversion ослабевает")
+        quality_warnings.append(f"⚠️ Hurst(EMA)={hurst:.3f} ≥ 0.48 — ослабевает")
     elif hurst >= 0.45:
-        quality_warnings.append(f"💡 Hurst={hurst:.3f} — пограничное значение (DFA шум ±0.05)")
+        quality_warnings.append(f"💡 Hurst(EMA)={hurst:.3f} — пограничное")
     if pvalue >= 0.10:
         quality_warnings.append(f"⚠️ P-value={pvalue:.3f} — коинтеграция ослабла!")
     if corr < 0.2:
@@ -561,7 +587,7 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 st.title("📍 Pairs Position Monitor")
-st.caption("v9.0 | 21.02.2026 | Hurst DFA FIX + PnL/Z disagree + Moscow time")
+st.caption("v11.0 | 21.02.2026 | False convergence fix + Hurst EMA + Z-sync")
 
 # Sidebar
 with st.sidebar:
